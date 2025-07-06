@@ -392,7 +392,9 @@ pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_u
 
                 let mut success_all: c_int = 1;
                 for task in TASKS.iter_mut() {
-                    success_all &= task.await.is_ok() as c_int;
+                    success_all &= task.await
+                        .expect("Coro must always return error by return value")
+                        .is_ok() as c_int;
                 }
                 success_all as *const c_char
             })

@@ -1,5 +1,6 @@
 use std::io::{self, Read};
 use std::path::{self, Path};
+use std::net::SocketAddr;
 use std::fs::File;
 use tokio::{spawn, net::{TcpListener, TcpSocket, TcpStream}};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -32,11 +33,13 @@ async fn extract_path_inside_cwd(stream: &mut TcpStream) -> Result<path::PathBuf
     get_path_inside_cwd(path.as_str())
 }
 
-async fn handle_file(mut stream: TcpStream) {
+async fn handle_file(mut stream: TcpStream, from_addr: SocketAddr) {
     let path = match extract_path_inside_cwd(&mut stream).await {
         Ok(p) => p,
         Err(_) => return,
     };
+
+    eprintln!("LOG: got {} from {from_addr}", path.display());
 
     let mut buf = vec![];
     let mut file = match File::open(&path) {
@@ -46,17 +49,25 @@ async fn handle_file(mut stream: TcpStream) {
         }
         Ok(f) => f,
     };
-    if let Err(e) = file.read_to_end(&mut buf) {
-        eprintln!("ERROR: Couldn't read file \"{}\": {e}", path.display());
-        return;
+
+    match file.read_to_end(&mut buf) {
+        Err(e) => {
+            eprintln!("ERROR: Couldn't read file \"{}\": {e}", path.display());
+            return;
+        },
+        Ok(n) => {
+            eprintln!("LOG: read {} for {from_addr} {n} bytes", path.display());
+        }
     }
 
     if let Err(e) = stream.write_all(&buf).await {
         eprintln!("ERROR: Couldn't respond with file \"{}\": {e}", path.display());
+        return;
     }
+    eprintln!("LOG: connection {from_addr} handled successfully");
 }
 
-async fn handle_dirs(mut stream: TcpStream) {
+async fn handle_dirs(mut stream: TcpStream, from_addr: SocketAddr) {
     let dir_count = match stream.read_u32().await {
         Ok(c) => c as usize,
         Err(e) => {
@@ -64,6 +75,8 @@ async fn handle_dirs(mut stream: TcpStream) {
             return;
         }
     };
+
+    eprintln!("LOG: dir_count = {dir_count} from {from_addr}");
 
     const U32_SIZE: usize = std::mem::size_of::<u32>();
     let mut dir_sizes: Vec<u8> = vec![0_u8; dir_count*U32_SIZE];
@@ -92,6 +105,8 @@ async fn handle_dirs(mut stream: TcpStream) {
         let dir_size = u32::from_be_bytes(dir_sizes[byte_ind..byte_ind+U32_SIZE].try_into().unwrap()) as usize;
         let dir_path = &dir_paths[dir_paths_read..dir_paths_read+dir_size];
         dir_paths_read += dir_size;
+
+        eprintln!("LOG: connection {from_addr}: dir_path = {dir_path}");
 
         let path_checked = match get_path_inside_cwd(dir_path) {
             Err(e) => {
@@ -133,6 +148,8 @@ async fn handle_dirs(mut stream: TcpStream) {
     if let Err(e) = stream.shutdown().await {
         eprintln!("ERROR: Couldn't properly shutdown stream: {e}");
     }
+
+    eprintln!("LOG: connection {from_addr} handled successfully");
 }
 
 pub async fn start_server(addr: String) {
@@ -152,6 +169,9 @@ pub async fn start_server(addr: String) {
                 break;
             }
         };
+
+        eprintln!("LOG: got connection from: {from_addr}");
+
         let ttype = match stream.read_u8().await {
             Ok(t) => t,
             Err(e) => {
@@ -159,8 +179,10 @@ pub async fn start_server(addr: String) {
                 continue;
             },
         };
+        eprintln!("LOG: connection {from_addr}: got request type = {ttype}");
+
         match ttype {
-            crate::REQUESTING_FILE => _ = spawn(handle_file(stream)),
+            crate::REQUESTING_FILE => _ = spawn(handle_file(stream, from_addr)),
             crate::REQUESTING_DIRS => _ = spawn(handle_dirs(stream)),
             _ => {
                 eprintln!("Got invalid request type = {ttype} from {from_addr}");
