@@ -38,7 +38,6 @@ async fn send_request_type(stream: &mut TcpStream, ttype: u8) -> Result<(), io::
 
 #[repr(C)]
 pub struct TfFileNative {
-    content: *const c_char,
     content_length: c_ulong,
     path: *const c_char,
     saving_name: *const c_char
@@ -60,25 +59,17 @@ impl<'a> TfFile<'a> {
     }
 
     fn from_native(f: &TfFileNative, vec: &'a mut Vec<String>) -> Result<Self, std::string::FromUtf8Error> {
-        let strings = Self::from_string_natives(f)?;
-        vec.push(strings.0);
-        vec.push(strings.1);
-
-        let content = unsafe { Vec::<u8>::from(&*std::ptr::slice_from_raw_parts(f.content as *const u8, f.content_length as usize)) };
-
-        Ok(TfFile {
-            content,
-            path: vec[vec.len() - 1].as_str(),
-            saving_name: vec[vec.len() - 2].as_str(),
-        })
-    }
-
-    fn from_string_natives(f: &TfFileNative) -> Result<(String, String), std::string::FromUtf8Error> {
         unsafe {
             let path = String::from_utf8(Vec::from(CStr::from_ptr(f.path).to_bytes()))?;
             let saving_name = String::from_utf8(Vec::from(CStr::from_ptr(f.saving_name).to_bytes()))?;
-            Ok((path, saving_name))
+            vec.push(path);
+            vec.push(saving_name);
         }
+
+        Ok(Self::new(
+            vec[vec.len() - 1].as_str(),
+            vec[vec.len() - 2].as_str()
+        ))
     }
 
     fn from_path(path: &'a Path) -> Result<TfFile<'a>, io::Error> {
@@ -437,7 +428,7 @@ async fn main() {
         spawn_requests(&mut FILES, FROM_PORT_START, TO_ADDR, &mut TASKS);
 
         for task in TASKS.iter_mut() {
-            task.await.unwrap();
+            _ = task.await.unwrap();
         }
     }
 }
