@@ -6,9 +6,11 @@
 #![allow(static_mut_refs)]
 
 use core::ffi::{*};
+use std::ffi::CString;
 use std::io::{self, prelude::*};
 use std::sync::Arc;
 use std::str;
+use std::sync::{TryLockResult, MutexGuard, Mutex};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::fs::File;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
@@ -38,7 +40,6 @@ async fn send_request_type(stream: &mut TcpStream, ttype: u8) -> Result<(), io::
 
 #[repr(C)]
 pub struct TfFileNative {
-    content_length: c_ulong,
     path: *const c_char,
     saving_name: *const c_char
 }
@@ -118,9 +119,7 @@ impl<'a> TfFile<'a> {
             }
         };
 
-        if let Err(error) = send_request_type(&mut stream, REQUESTING_FILE).await {
-            return Err(error);
-        }
+        send_request_type(&mut stream, REQUESTING_FILE).await?;
 
         if let Err(error) = stream.write_all(self.path.as_bytes()).await {
             eprintln!("ERROR: can't request file \"{}\": {}", self.path, error);
@@ -174,10 +173,22 @@ fn spawn_requests(files: &'static mut Vec<TfFile<'_>>, from_port_start: u16, to_
 
 /* Could use Arc<Mutex> or Arc<RwLock> or raw pointers */
 /* Could rethink whole design to easily deal with it asyncly */
+
+/* Meant only for OUTPUT_STRING variable to 'lazy-initialize it.
+ *  TODO: Check if it's a bad practice and, if so, what cons it has
+ */
+enum LazyOutputString {
+    Init(CString),
+    Uninit(),
+}
+
+static mut PROCESSING: Mutex<()> = Mutex::new(());
 static mut FILES: Vec<TfFile> = Vec::new();
 static mut ARGS: Vec<String> = Vec::new();
 static mut TASKS: Vec<JoinHandle<Result<(), io::Error>>> = Vec::new();
 static mut TO_ADDR: SocketAddr = get_local_addr(0);
+static mut OUTPUT_STRING: LazyOutputString = LazyOutputString::Uninit();
+static mut OUTPUT_C_CHAR_PTR: *const c_char = 0 as *const c_char;
 
 enum InputMode {
     ShowHelp,
@@ -249,28 +260,7 @@ tfrecv (help|list|download|serve) IP_ADDRESS [dirs|paths to files]
     );
 }
 
-async fn dump_response_to_stdout(stream: &mut TcpStream) {
-    let mut buf = [0_u8; 1024];
-
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => {
-                io::stdout().flush().expect("Flushing stdout mustn't fail");
-                break;
-            }
-            Ok(read_count) => {
-                let _ = io::stdout().write(&buf[0..read_count]).expect("Write to stdout mustn't fail");
-            }
-            Err(e) => {
-                if e.kind() == io::ErrorKind::WouldBlock { continue; }
-                eprintln!("ERROR: Couldn't read response from server: {e}");
-                break;
-            }
-        }
-    }
-}
-
-async fn query_lists(args: &[String], addr: SocketAddr) -> Result<(), io::Error> {
+async fn query_lists(args: &[String], addr: SocketAddr) -> Result<*const c_char, io::Error> {
     let sizes: Arc<[u8]> = args.iter().flat_map(|arg| {
         (arg.len() as u32).to_be_bytes()
     }).collect();
@@ -309,24 +299,58 @@ async fn query_lists(args: &[String], addr: SocketAddr) -> Result<(), io::Error>
         return Err(e);
     }
 
-    dump_response_to_stdout(&mut stream).await;
-    Ok(())
+    let mut resp = String::new();
+
+    match stream.read_to_string(&mut resp).await {
+        Err(e) => {
+            eprintln!("ERROR: Couldn't read response from server: {e}");
+            return Err(e);
+        }
+        Ok(0) => {
+            eprintln!("ERROR: Received empty response from server");
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, ""));
+        },
+        Ok(_) => {},
+    }
+
+    // SAFETY: query_lists is called with mutual exclusion
+    unsafe {
+        let cstring = match CString::new(resp) {
+            Err(e) => {
+                eprintln!("ERROR: Couldn't convert response to c string: {e}");
+                return Err(io::Error::new(io::ErrorKind::InvalidData, ""));
+            },
+            Ok(c) => c,
+        };
+        OUTPUT_STRING = LazyOutputString::Init(cstring);
+        OUTPUT_C_CHAR_PTR = match &OUTPUT_STRING {
+            LazyOutputString::Init(c) => c.as_ptr(),
+            LazyOutputString::Uninit() => unreachable!(),
+        };
+        Ok(OUTPUT_C_CHAR_PTR)
+    }
 }
 
-unsafe fn prepare_files_and_args() -> bool {
+// SAFETY: mutex's used for thread-safety
+unsafe fn lock_and_prepare_files_and_args() -> TryLockResult<MutexGuard<'static, ()>> {
+    let res = PROCESSING.try_lock();
+    if res.is_err() { return res; }
+
     FILES.clear();
     ARGS.clear();
 
-    // TODO
-    true
+    res
 }
 
 // SAFETY: External function to request multiple function
 #[no_mangle]
-pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_ulong, to_addr: *const c_char, list_dirs: c_int) -> c_int {
-    if !prepare_files_and_args() { 
-        return 0;
-    }
+pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_ulong, to_addr: *const c_char, list_dirs: c_int) -> *const c_char {
+    const NULL: *const c_char = std::ptr::null::<c_char>();
+
+    let _mutex_guard = match lock_and_prepare_files_and_args() { 
+        Err(_) => { return NULL; }
+        Ok(g) => g,
+    };
 
     let nfiles_sl = &*std::ptr::slice_from_raw_parts(files, count as usize);
     for nfile in nfiles_sl {
@@ -334,7 +358,7 @@ pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_u
             Ok(file) => FILES.push(file),
             Err(e) => {
                 eprintln!("Couldn't get valid information from passed file: {e}");
-                return 0;
+                return NULL;
             }
         }
     }
@@ -342,38 +366,35 @@ pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_u
     match CStr::from_ptr(to_addr).to_str() {
         Err(e) => {
             eprintln!("ERROR: Couldn't parse to_addr: {e}");
-            return 0;
+            return NULL;
         },
         Ok(a) => TO_ADDR = match a.parse::<SocketAddr>() {
             Err(e) => {
                 eprintln!("ERROR: Couldn't parse to_addr: {e}");
-                return 0;
+                return NULL;
             },
             Ok(a) => a,
         }
     }
 
-    // TODO: remove duplication without boxing closures
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     if list_dirs != 0 {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
+        runtime
             .block_on(query_lists(&ARGS, TO_ADDR))
-            .is_ok() as c_int
+            .unwrap_or(NULL)
     } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap()
+        runtime
             .block_on(async move {
                 spawn_requests(&mut FILES, FROM_PORT_START, TO_ADDR, &mut TASKS);
 
-                let mut success_all = true;
+                let mut success_all: c_int = 1;
                 for task in TASKS.iter_mut() {
-                    success_all &= task.await.is_ok();
+                    success_all &= task.await.is_ok() as c_int;
                 }
-                success_all as c_int
+                success_all as *const c_char
             })
     }
 }
