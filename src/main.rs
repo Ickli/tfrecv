@@ -16,6 +16,7 @@ use std::fs::File;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::task::JoinHandle;
 use std::path::Path;
+use std::error::Error;
 use tokio::{spawn, net::{TcpSocket, TcpStream}};
 
 mod server;
@@ -28,6 +29,22 @@ const FROM_PORT_START: u16 = 49152;
 
 pub const fn get_local_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127,0,0,1)), port)
+}
+
+unsafe fn set_output_string(string: &str) -> Result<*const c_char, io::Error> {
+    let cstring = match CString::new(string) {
+        Err(e) => {
+            eprintln!("ERROR: Couldn't convert response to c string: {e}");
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ERROR: Couldn't convert response to c string"));
+        },
+        Ok(c) => c,
+    };
+    OUTPUT_STRING = LazyOutputString::Init(cstring);
+    OUTPUT_C_CHAR_PTR = match &OUTPUT_STRING {
+        LazyOutputString::Init(c) => c.as_ptr(),
+        LazyOutputString::Uninit() => unreachable!(),
+    };
+    Ok(OUTPUT_C_CHAR_PTR)
 }
 
 async fn send_request_type(stream: &mut TcpStream, ttype: u8) -> Result<(), io::Error> {
@@ -109,7 +126,10 @@ impl<'a> TfFile<'a> {
             eprintln!("ERROR: Couldn't bind socket: {}", error);
             return Err(error);
         }
-        
+
+        if let Err(error) = socket.set_reuseaddr(true) {
+            eprintln!("WARNING: Can't reuse address: {}", error);
+        }
 
         let mut stream = match socket.connect(to_addr).await {
             Ok(stream) => stream,
@@ -138,7 +158,7 @@ impl<'a> TfFile<'a> {
             },
             Ok(0) => {
                 eprintln!("ERROR: got an empty response, file \"{}\" not saved", self.path);
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, ""));
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ERROR: got an empty response"));
             },
             Ok(_) => {},
         }
@@ -308,36 +328,25 @@ async fn query_lists(args: &[String], addr: SocketAddr) -> Result<*const c_char,
         }
         Ok(0) => {
             eprintln!("ERROR: Received empty response from server");
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, ""));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "ERROR: Received empty response from server"));
         },
         Ok(_) => {},
     }
 
     // SAFETY: query_lists is called with mutual exclusion
     unsafe {
-        let cstring = match CString::new(resp) {
-            Err(e) => {
-                eprintln!("ERROR: Couldn't convert response to c string: {e}");
-                return Err(io::Error::new(io::ErrorKind::InvalidData, ""));
-            },
-            Ok(c) => c,
-        };
-        OUTPUT_STRING = LazyOutputString::Init(cstring);
-        OUTPUT_C_CHAR_PTR = match &OUTPUT_STRING {
-            LazyOutputString::Init(c) => c.as_ptr(),
-            LazyOutputString::Uninit() => unreachable!(),
-        };
-        Ok(OUTPUT_C_CHAR_PTR)
+        set_output_string(resp.as_str())
     }
 }
 
 // SAFETY: mutex's used for thread-safety
-unsafe fn lock_and_prepare_files_and_args() -> TryLockResult<MutexGuard<'static, ()>> {
+unsafe fn lock_and_prepare_statics() -> TryLockResult<MutexGuard<'static, ()>> {
     let res = PROCESSING.try_lock();
     if res.is_err() { return res; }
 
     FILES.clear();
     ARGS.clear();
+    TASKS.clear();
 
     res
 }
@@ -347,19 +356,35 @@ unsafe fn lock_and_prepare_files_and_args() -> TryLockResult<MutexGuard<'static,
 pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_ulong, to_addr: *const c_char, list_dirs: c_int) -> *const c_char {
     const NULL: *const c_char = std::ptr::null::<c_char>();
 
-    let _mutex_guard = match lock_and_prepare_files_and_args() { 
+    let _mutex_guard = match lock_and_prepare_statics() { 
         Err(_) => { return NULL; }
         Ok(g) => g,
     };
 
     let nfiles_sl = &*std::ptr::slice_from_raw_parts(files, count as usize);
-    for nfile in nfiles_sl {
-        match TfFile::from_native(nfile, &mut ARGS) {
-            Ok(file) => FILES.push(file),
-            Err(e) => {
-                eprintln!("Couldn't get valid information from passed file: {e}");
-                return NULL;
+    if list_dirs == 0 {
+        for nfile in nfiles_sl {
+            match TfFile::from_native(nfile, &mut ARGS) {
+                Ok(file) => FILES.push(file),
+                Err(e) => {
+                    eprintln!("Couldn't get valid information from passed file: {e}");
+                    return NULL;
+                }
             }
+        }
+    } else {
+        let mut any_success_conv = false;
+
+        for nfile in nfiles_sl {
+            if let Ok(path) = String::from_utf8(Vec::from(CStr::from_ptr(nfile.path).to_bytes())) {
+                ARGS.push(path);
+                any_success_conv = true;
+            }
+        }
+
+        if !any_success_conv {
+            set_output_string("ERROR: couldn't convert any dir names to utf8");
+            return NULL;
         }
     }
 
@@ -381,24 +406,51 @@ pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_u
         .enable_all()
         .build()
         .unwrap();
-    if list_dirs != 0 {
+    let res = if list_dirs != 0 {
         runtime
             .block_on(query_lists(&ARGS, TO_ADDR))
-            .unwrap_or(NULL)
     } else {
         runtime
             .block_on(async move {
                 spawn_requests(&mut FILES, FROM_PORT_START, TO_ADDR, &mut TASKS);
 
-                let mut success_all: c_int = 1;
+                let mut res: Result<*const c_char, io::Error> = Ok(1 as c_int as *const c_char);
                 for task in TASKS.iter_mut() {
-                    success_all &= task.await
-                        .expect("Coro must always return error by return value")
-                        .is_ok() as c_int;
+                    if let Err(e) = task.await.expect("Coro must always return error by return value") {
+                        if res.is_ok() {
+                            res = Err(e);
+                        }
+                    }
                 }
-                success_all as *const c_char
+                res
             })
+    };
+
+    match res {
+        Err(e) => unsafe { 
+            let _ = set_output_string(e.description()).expect("Error message converts to valid c string");
+            NULL
+        },
+        Ok(res) => res,
     }
+}
+
+// SAFETY: External function to get an error
+#[no_mangle]
+pub unsafe extern "C" fn get_error() -> *const c_char {
+    const NULL: *const c_char = std::ptr::null::<c_char>();
+
+    let _mutex_guard = match lock_and_prepare_statics() { 
+        Err(_) => { return NULL; }
+        Ok(g) => g,
+    };
+
+    if let LazyOutputString::Uninit() = OUTPUT_STRING {
+        eprintln!("ERROR: error string was not set");
+        return NULL;
+    }
+
+    return OUTPUT_C_CHAR_PTR;
 }
 
 #[tokio::main]

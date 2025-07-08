@@ -12,7 +12,11 @@ fn get_path_inside_cwd(path_str: &str) -> Result<path::PathBuf, io::Error> {
             return Err(e);
         }
     };
-    let cwd = std::env::current_dir().expect("Must return cwd");
+    // We canonicalize it so that prefix "\\?\" on Windows is in both cwd and path
+    let cwd = std::env::current_dir()
+        .expect("Must return cwd")
+        .canonicalize()
+        .expect("CWD just returned from current_dir() must canonicalize successfully");
     if !path.starts_with(&cwd) {
         let err_str = format!("ERROR: Requested file \"{}\" is outside cwd = \"{}\"", path.display(), cwd.display());
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_str));
@@ -36,7 +40,10 @@ async fn extract_path_inside_cwd(stream: &mut TcpStream) -> Result<path::PathBuf
 async fn handle_file(mut stream: TcpStream, from_addr: SocketAddr) {
     let path = match extract_path_inside_cwd(&mut stream).await {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("ERROR: connection {from_addr}: couldn't read path to file: {e}");
+            return;
+        }
     };
 
     eprintln!("LOG: got {} from {from_addr}", path.display());
@@ -183,7 +190,7 @@ pub async fn start_server(addr: String) {
 
         match ttype {
             crate::REQUESTING_FILE => _ = spawn(handle_file(stream, from_addr)),
-            crate::REQUESTING_DIRS => _ = spawn(handle_dirs(stream)),
+            crate::REQUESTING_DIRS => _ = spawn(handle_dirs(stream, from_addr)),
             _ => {
                 eprintln!("Got invalid request type = {ttype} from {from_addr}");
             }
