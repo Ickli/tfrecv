@@ -12,11 +12,12 @@ fn get_path_inside_cwd(path_str: &str) -> Result<path::PathBuf, io::Error> {
             return Err(e);
         }
     };
+    
     // We canonicalize it so that prefix "\\?\" on Windows is in both cwd and path
     let cwd = std::env::current_dir()
         .expect("Must return cwd")
         .canonicalize()
-        .expect("CWD just returned from current_dir() must canonicalize successfully");
+        .expect("CWD canonicalizes fine");
     if !path.starts_with(&cwd) {
         let err_str = format!("ERROR: Requested file \"{}\" is outside cwd = \"{}\"", path.display(), cwd.display());
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, err_str));
@@ -41,7 +42,7 @@ async fn handle_file(mut stream: TcpStream, from_addr: SocketAddr) {
     let path = match extract_path_inside_cwd(&mut stream).await {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ERROR: connection {from_addr}: couldn't read path to file: {e}");
+            eprintln!("ERROR: connection {from_addr}: couldn't get path to file from client: {e}");
             return;
         }
     };
@@ -142,12 +143,28 @@ async fn handle_dirs(mut stream: TcpStream, from_addr: SocketAddr) {
                 Err(_) => continue
             };
 
-            if let Err(e) = stream.write_all(entry.path().as_os_str().to_str().unwrap().as_bytes()).await {
+            let mut entry_buf = entry.path();
+
+            match entry.file_type() {
+                Err(e) => {
+                    eprintln!("ERROR: Couldn't get type of \"{}\": {e}", entry.path().display());
+                    continue;
+                },
+                Ok(ttype) if ttype.is_dir() => {
+                    // Pushing "", empty string, appends '/' at the end
+                    entry_buf.push("");
+                }
+                Ok(_) => {},
+            }
+
+            if let Err(e) = stream.write_all(entry_buf.to_str().expect("Entry path is a valid str").as_bytes()).await {
                 eprintln!("ERROR: Couldn't write \"{}\" to stream: {e}", entry.path().display());
             }
 
             if let Err(e) = stream.write_all("\r\n".as_bytes()).await {
                 eprintln!("ERROR: Couldn't write \"{}\" to stream: {e}", entry.path().display());
+                // breaking because if fail to pass delimiters then further entries will concatenate with current one
+                break;
             }
         }
     }
@@ -155,8 +172,6 @@ async fn handle_dirs(mut stream: TcpStream, from_addr: SocketAddr) {
     if let Err(e) = stream.shutdown().await {
         eprintln!("ERROR: Couldn't properly shutdown stream: {e}");
     }
-
-    eprintln!("LOG: connection {from_addr} handled successfully");
 }
 
 pub async fn start_server(addr: String) {

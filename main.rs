@@ -124,8 +124,8 @@ impl<'a> TfFile<'a> {
         }
 
         Ok(Self::new(
-            vec[vec.len() - 2].as_str(),
-            vec[vec.len() - 1].as_str()
+            vec[vec.len() - 1].as_str(),
+            vec[vec.len() - 2].as_str()
         ))
     }
 
@@ -183,7 +183,7 @@ impl<'a> TfFile<'a> {
         if let Err(error) = self.save() {
             eprintln!("ERROR: file \"{}\" not saved: {}", self.path, error);
         } else {
-            eprintln!("LOG: Saved \"{}\" in current directory as \"{}\"", self.path, self.saving_name);
+            eprintln!("LOG: Saved \"{}\" in current directory", self.path);
         }
         
         Ok(())
@@ -446,7 +446,7 @@ pub unsafe extern "C" fn request_blocking(files: *const TfFileNative, count: c_u
 
     match res {
         Err(e) => unsafe { 
-            let _ = set_output_string(&e.to_string()).expect("Error message converts to valid c string");
+            let _ = set_output_string(e.description()).expect("Error message converts to valid c string");
             NULL
         },
         Ok(res) => res,
